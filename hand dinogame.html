@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hand Dino</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #1a1a1a; font-family: system-ui, sans-serif; color: #f0f0f0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+#stage { position: relative; flex: 1; overflow: hidden; }
+
+#webcam {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; transform: scaleX(-1); opacity: 0.22;
+}
+
+#gameCanvas {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+}
+
+#overlayCanvas {
+  position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none;
+}
+
+#loading-overlay {
+  position: absolute; inset: 0; background: #1a1a1a;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+  z-index: 20;
+}
+#loading-overlay p { font-size: 15px; color: rgba(255,255,255,0.55); text-align: center; max-width: 300px; }
+.spinner { width: 38px; height: 38px; border: 3px solid rgba(255,255,255,0.1); border-top-color: #4ade80; border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#hud {
+  position: absolute; top: 14px; right: 18px;
+  font-size: 18px; font-weight: 700; letter-spacing: 2px; color: rgba(255,255,255,0.7);
+  font-variant-numeric: tabular-nums;
+}
+
+#gesture-badge {
+  position: absolute; top: 14px; left: 18px;
+  font-size: 26px; pointer-events: none;
+}
+
+#legend {
+  position: absolute; bottom: 14px; left: 18px;
+  font-size: 12px; color: rgba(255,255,255,0.35); line-height: 1.9;
+}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="gameCanvas"></canvas>
+  <canvas id="overlayCanvas"></canvas>
+
+  <div id="hud">00000</div>
+  <div id="gesture-badge"></div>
+  <div id="legend">☝️ One finger up = jump<br>✌️ Two fingers = duck<br>Show hand to camera</div>
+
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <p id="loading-text">Starting camera…</p>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+// ─── CANVAS SETUP ───────────────────────────────────────────
+const gc = document.getElementById('gameCanvas');
+const gctx = gc.getContext('2d');
+const oc = document.getElementById('overlayCanvas');
+const octx = oc.getContext('2d');
+const hudEl = document.getElementById('hud');
+const badgeEl = document.getElementById('gesture-badge');
+
+function resize() {
+  const s = document.getElementById('stage');
+  gc.width = oc.width = s.clientWidth;
+  gc.height = oc.height = s.clientHeight;
+}
+window.addEventListener('resize', () => { resize(); });
+resize();
+
+// ─── GAME CONSTANTS ─────────────────────────────────────────
+const GROUND_RATIO = 0.72;   // ground y as fraction of height
+const DINO_W = 44, DINO_H = 52;
+const DINO_DUCK_W = 58, DINO_DUCK_H = 30;
+const GRAVITY = 0.55;
+const JUMP_VY = -13;
+
+// ─── GAME STATE ─────────────────────────────────────────────
+let state = 'waiting'; // waiting | running | dead
+let score = 0;
+let hiScore = 0;
+let speed = 5;
+let frameCount = 0;
+let dinoY, dinoVY, ducking, onGround;
+let obstacles = [];
+let clouds = [];
+let particles = [];
+let groundOffset = 0;
+let lastObstacle = 0;
+let jumpRequested = false;
+let duckRequested = false;
+let stepFrame = 0;
+
+function groundY() { return gc.height * GROUND_RATIO; }
+
+function resetGame() {
+  dinoY = groundY();
+  dinoVY = 0;
+  ducking = false;
+  onGround = true;
+  obstacles = [];
+  clouds = [{ x: gc.width * 0.5, y: gc.height * 0.2, w: 80 }, { x: gc.width * 0.8, y: gc.height * 0.15, w: 60 }];
+  score = 0;
+  speed = 5;
+  frameCount = 0;
+  lastObstacle = 120;
+  particles = [];
+  groundOffset = 0;
+  stepFrame = 0;
+  state = 'running';
+}
+
+// ─── OBSTACLE SPAWNER ────────────────────────────────────────
+function spawnObstacle() {
+  const type = Math.random() < 0.3 ? 'bird' : 'cactus';
+  const gY = groundY();
+  if (type === 'cactus') {
+    const h = 40 + Math.random() * 30;
+    const w = 20 + Math.random() * 18;
+    const count = Math.floor(1 + Math.random() * 2);
+    obstacles.push({ type: 'cactus', x: gc.width + 20, y: gY - h, w: w * count + (count-1)*6, h, count });
+  } else {
+    const row = Math.random() < 0.5 ? gY - 80 : gY - 130;
+    obstacles.push({ type: 'bird', x: gc.width + 20, y: row, w: 46, h: 28, wingUp: true, wingTimer: 0 });
+  }
+}
+
+// ─── DRAWING HELPERS ────────────────────────────────────────
+function drawDino(x, y, duck, dead) {
+  const ctx = gctx;
+  const w = duck ? DINO_DUCK_W : DINO_W;
+  const h = duck ? DINO_DUCK_H : DINO_H;
+  const color = dead ? '#ef4444' : '#4ade80';
+
+  ctx.fillStyle = color;
+
+  if (!duck) {
+    // body
+    ctx.fillRect(x - w/2 + 8, y - h, w - 8, h - 10);
+    // head
+    ctx.fillRect(x - w/2 + 14, y - h - 16, 22, 18);
+    // eye
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(x - w/2 + 28, y - h - 12, 5, 5);
+    ctx.fillStyle = color;
+    // tail
+    ctx.fillRect(x - w/2, y - h + 10, 12, 14);
+    // legs (animate)
+    const leg = (stepFrame < 8) ? 0 : 1;
+    ctx.fillStyle = color;
+    ctx.fillRect(x - w/2 + 16 + (leg ? 10 : 0), y - 14, 8, 16);
+    ctx.fillRect(x - w/2 + 16 + (leg ? 0 : 10), y - 10, 8, 12);
+    // arm
+    ctx.fillRect(x - w/2 + 24, y - h + 16, 14, 7);
+  } else {
+    // duck body
+    ctx.fillRect(x - w/2 + 6, y - h, w - 6, h - 4);
+    // duck head
+    ctx.fillRect(x - w/2 + w - 20, y - h - 10, 18, 14);
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(x - w/2 + w - 9, y - h - 7, 4, 4);
+    ctx.fillStyle = color;
+    // duck legs
+    const leg = (stepFrame < 8) ? 0 : 1;
+    ctx.fillRect(x - w/2 + 14 + (leg ? 10 : 0), y - 8, 8, 10);
+    ctx.fillRect(x - w/2 + 14 + (leg ? 0 : 10), y - 5, 8, 7);
+    // tail
+    ctx.fillRect(x - w/2, y - h + 4, 10, 10);
+  }
+}
+
+function drawCactus(o) {
+  gctx.fillStyle = '#4ade80';
+  const stemW = o.w / o.count;
+  for (let i = 0; i < o.count; i++) {
+    const cx = o.x + i * (stemW + 6);
+    gctx.fillRect(cx, o.y, stemW - 2, o.h);
+    // arms
+    if (o.h > 45) {
+      gctx.fillRect(cx - 8, o.y + 12, 8, 8);
+      gctx.fillRect(cx - 8, o.y + 5, 5, 14);
+      gctx.fillRect(cx + stemW - 2, o.y + 14, 8, 8);
+      gctx.fillRect(cx + stemW - 2, o.y + 7, 5, 14);
+    }
+  }
+}
+
+function drawBird(o) {
+  const ctx = gctx;
+  ctx.fillStyle = '#f87171';
+  // body
+  ctx.beginPath();
+  ctx.ellipse(o.x + 20, o.y + 14, 16, 10, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // beak
+  ctx.fillStyle = '#fbbf24';
+  ctx.beginPath();
+  ctx.moveTo(o.x + 34, o.y + 14);
+  ctx.lineTo(o.x + 46, o.y + 12);
+  ctx.lineTo(o.x + 34, o.y + 18);
+  ctx.fill();
+  // eye
+  ctx.fillStyle = '#1a1a1a';
+  ctx.beginPath();
+  ctx.arc(o.x + 30, o.y + 11, 3, 0, Math.PI * 2);
+  ctx.fill();
+  // wing
+  ctx.fillStyle = '#fca5a5';
+  ctx.beginPath();
+  if (o.wingUp) {
+    ctx.ellipse(o.x + 16, o.y + 4, 12, 7, -0.4, 0, Math.PI * 2);
+  } else {
+    ctx.ellipse(o.x + 16, o.y + 22, 12, 7, 0.4, 0, Math.PI * 2);
+  }
+  ctx.fill();
+}
+
+function drawCloud(c) {
+  gctx.fillStyle = 'rgba(255,255,255,0.08)';
+  gctx.beginPath();
+  gctx.ellipse(c.x, c.y, c.w / 2, 12, 0, 0, Math.PI * 2);
+  gctx.ellipse(c.x - 20, c.y + 6, c.w / 4, 9, 0, 0, Math.PI * 2);
+  gctx.ellipse(c.x + 20, c.y + 6, c.w / 4, 9, 0, 0, Math.PI * 2);
+  gctx.fill();
+}
+
+function drawGround() {
+  const gY = groundY();
+  gctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  gctx.lineWidth = 2;
+  gctx.beginPath();
+  gctx.moveTo(0, gY + 4);
+  gctx.lineTo(gc.width, gY + 4);
+  gctx.stroke();
+  // pebbles
+  gctx.fillStyle = 'rgba(255,255,255,0.12)';
+  for (let i = 0; i < 20; i++) {
+    const px = ((i * 80 - groundOffset) % gc.width + gc.width) % gc.width;
+    gctx.fillRect(px, gY + 8, 4 + (i % 3) * 3, 2);
+  }
+}
+
+function drawScore() {
+  const s = String(Math.floor(score)).padStart(5, '0');
+  hudEl.textContent = (hiScore > 0 ? 'HI ' + String(Math.floor(hiScore)).padStart(5,'0') + '   ' : '') + s;
+}
+
+// ─── COLLISION ──────────────────────────────────────────────
+function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  const pad = 8;
+  return ax + pad < bx + bw - pad && ax + aw - pad > bx + pad &&
+         ay + pad < by + bh - pad && ay + ah - pad > by + pad;
+}
+
+// ─── GAME LOOP ──────────────────────────────────────────────
+function gameLoop() {
+  requestAnimationFrame(gameLoop);
+  const W = gc.width, H = gc.height;
+  const gY = groundY();
+
+  gctx.clearRect(0, 0, W, H);
+
+  if (state === 'waiting') {
+    drawGround();
+    // draw dino idle
+    drawDino(W * 0.15, gY, false, false);
+    gctx.fillStyle = 'rgba(255,255,255,0.6)';
+    gctx.font = 'bold 22px system-ui';
+    gctx.textAlign = 'center';
+    gctx.fillText('Show your hand to the camera', W / 2, H * 0.38);
+    gctx.font = '15px system-ui';
+    gctx.fillStyle = 'rgba(255,255,255,0.35)';
+    gctx.fillText('☝️  raise one finger to start & jump', W / 2, H * 0.38 + 36);
+    gctx.textAlign = 'left';
+    return;
+  }
+
+  if (state === 'dead') {
+    drawGround();
+    obstacles.forEach(o => { if (o.type === 'cactus') drawCactus(o); else drawBird(o); });
+    drawDino(W * 0.15, gY, false, true);
+    gctx.fillStyle = '#ef4444';
+    gctx.font = 'bold 26px system-ui';
+    gctx.textAlign = 'center';
+    gctx.fillText('GAME OVER', W / 2, H * 0.38);
+    gctx.font = '15px system-ui';
+    gctx.fillStyle = 'rgba(255,255,255,0.45)';
+    gctx.fillText('☝️  raise one finger to try again', W / 2, H * 0.38 + 38);
+    gctx.textAlign = 'left';
+    drawScore();
+    return;
+  }
+
+  // ── running ──
+  frameCount++;
+  score += 0.1;
+  speed = 5 + Math.floor(score / 100) * 0.4;
+
+  // ground scroll
+  groundOffset = (groundOffset + speed) % gc.width;
+
+  // step anim
+  stepFrame = (stepFrame + 1) % 16;
+
+  // dino physics
+  ducking = duckRequested && onGround;
+
+  if (jumpRequested && onGround) {
+    dinoVY = JUMP_VY - (speed - 5) * 0.2;
+    onGround = false;
+    jumpRequested = false;
+  }
+
+  if (!onGround) {
+    dinoVY += GRAVITY;
+    dinoY += dinoVY;
+    if (dinoY >= gY) { dinoY = gY; dinoVY = 0; onGround = true; }
+  }
+
+  // clouds
+  clouds.forEach(c => { c.x -= speed * 0.3; });
+  clouds = clouds.filter(c => c.x > -120);
+  if (Math.random() < 0.004) clouds.push({ x: W + 80, y: H * 0.1 + Math.random() * H * 0.2, w: 60 + Math.random() * 60 });
+
+  // obstacles
+  lastObstacle--;
+  if (lastObstacle <= 0) {
+    spawnObstacle();
+    lastObstacle = 60 + Math.random() * 80 + (score < 100 ? 40 : 0);
+  }
+  obstacles.forEach(o => {
+    o.x -= speed;
+    if (o.type === 'bird') {
+      o.wingTimer++;
+      if (o.wingTimer > 12) { o.wingUp = !o.wingUp; o.wingTimer = 0; }
+    }
+  });
+  obstacles = obstacles.filter(o => o.x > -80);
+
+  // collision
+  const dW = ducking ? DINO_DUCK_W : DINO_W;
+  const dH = ducking ? DINO_DUCK_H : DINO_H;
+  const dinoX = W * 0.15 - dW / 2;
+  const dinoTop = dinoY - dH;
+
+  for (const o of obstacles) {
+    if (rectsOverlap(dinoX, dinoTop, dW, dH, o.x, o.y, o.w, o.h)) {
+      if (score > hiScore) hiScore = score;
+      state = 'dead';
+      return;
+    }
+  }
+
+  // draw
+  clouds.forEach(drawCloud);
+  drawGround();
+  obstacles.forEach(o => { if (o.type === 'cactus') drawCactus(o); else drawBird(o); });
+  drawDino(W * 0.15, dinoY, ducking, false);
+  drawScore();
+}
+
+// ─── HAND TRACKING ──────────────────────────────────────────
+function countExtended(lm) {
+  const tips = [8, 12, 16, 20], bases = [6, 10, 14, 18];
+  let n = 0;
+  for (let i = 0; i < 4; i++) if (lm[tips[i]].y < lm[bases[i]].y) n++;
+  return n;
+}
+
+let lastGesture = '';
+
+function onResults(results) {
+  octx.clearRect(0, 0, oc.width, oc.height);
+
+  if (!results.multiHandLandmarks || !results.multiHandLandmarks.length) {
+    badgeEl.textContent = '';
+    lastGesture = '';
+    return;
+  }
+
+  const lm = results.multiHandLandmarks[0];
+  const ext = countExtended(lm);
+
+  // draw skeleton
+  const conn = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+  octx.strokeStyle = 'rgba(74,222,128,0.25)';
+  octx.lineWidth = 1.5;
+  conn.forEach(([a, b]) => {
+    octx.beginPath();
+    octx.moveTo((1 - lm[a].x) * oc.width, lm[a].y * oc.height);
+    octx.lineTo((1 - lm[b].x) * oc.width, lm[b].y * oc.height);
+    octx.stroke();
+  });
+
+  // fingertip dot
+  const tx = (1 - lm[8].x) * oc.width, ty = lm[8].y * oc.height;
+  octx.beginPath();
+  octx.arc(tx, ty, 7, 0, Math.PI * 2);
+  octx.fillStyle = ext === 1 ? '#4ade80' : 'rgba(255,255,255,0.5)';
+  octx.fill();
+
+  if (ext === 1) {
+    badgeEl.textContent = '☝️';
+    if (lastGesture !== 'one') {
+      // trigger jump / start
+      if (state === 'waiting' || state === 'dead') { resetGame(); }
+      else { jumpRequested = true; }
+    }
+    lastGesture = 'one';
+    duckRequested = false;
+  } else if (ext === 2) {
+    badgeEl.textContent = '✌️';
+    lastGesture = 'two';
+    duckRequested = true;
+    jumpRequested = false;
+  } else if (ext === 0) {
+    badgeEl.textContent = '✊';
+    lastGesture = 'fist';
+    duckRequested = false;
+  } else {
+    badgeEl.textContent = '🖐️';
+    lastGesture = 'open';
+    duckRequested = false;
+  }
+}
+
+// ─── CAMERA INIT ────────────────────────────────────────────
+async function init() {
+  const video = document.getElementById('webcam');
+  const loadingText = document.getElementById('loading-text');
+  const loadingOverlay = document.getElementById('loading-overlay');
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: 'user' } });
+    video.srcObject = stream;
+    loadingText.textContent = 'Loading hand tracking…';
+
+    const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.6 });
+    hands.onResults(onResults);
+
+    const camera = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 1280, height: 720
+    });
+    await camera.start();
+    loadingOverlay.style.display = 'none';
+    gameLoop();
+
+  } catch (err) {
+    loadingText.textContent = err.name === 'NotAllowedError'
+      ? '⚠️ Camera blocked. Please allow camera access and reload.'
+      : '⚠️ Camera error: ' + err.message;
+    document.querySelector('.spinner').style.display = 'none';
+    gameLoop(); // run game anyway (no hand control)
+  }
+}
+
+init();
+</script>
+</body>
+</html>
